@@ -3960,3 +3960,551 @@ md文档里面写一下论文的时间和发表单位
 ````text
 已改正。第 16 节现在保存的是逐字问答原文，不再改写、整理或总结；包括你每次的原始问题和我当时的完整最终回答。
 ````
+
+## 消息 23：用户
+
+````text
+action expert的输入是什么
+````
+
+## 消息 24：回答
+
+````markdown
+Action Expert 主要接收四类输入：
+
+1. **带噪动作块**
+
+```text
+a_t
+```
+
+- 训练时：真实动作块与高斯噪声插值得到 `a_t`；
+- 推理时：从纯高斯噪声开始；
+- 同时输入 flow-matching 的生成时间 `t`。
+
+2. **VLM 语义上下文**
+
+```text
+H_VLM = VLM(主视角, 语言指令, 其他视角)
+```
+
+它告诉 Action Expert：
+
+- 当前任务是什么；
+- 要操作哪个物体；
+- 主视角和辅助视角中的语义信息。
+
+3. **LaWM 动力学上下文**
+
+```text
+u      = DINO(当前主视角)
+uT_hat = LaWM(u, z_hat)
+
+DynamicsContext = Concat(u, uT_hat)
+```
+
+其中：
+
+- `u` 是当前 DINO 特征；
+- `uT_hat` 是 LaWM 预测的未来视觉子目标；
+- 二者经过 Knowledge Insulation 后组成 dynamics stream。
+
+它告诉 Action Expert：
+
+```text
+场景现在是什么样
++
+动作块结束时应该变成什么样
+```
+
+4. **动作 token 的物理时间编码**
+
+```text
+physical_time_i = i / control_frequency
+```
+
+该编码告诉模型每个动作 token 对应多少真实时间，用于处理不同机器人的混合控制频率。变长动作块还会带 padding mask。
+
+因此可以把完整输入写成：
+
+```text
+ActionExpert(
+    noised_action_chunk = a_t,
+    flow_time = t,
+    semantic_context = H_VLM,
+    dynamics_context = Concat(u, uT_hat),
+    physical_time_encoding,
+    attention_mask
+)
+```
+
+Action Expert 预测动作 flow/velocity，经过约 10 次积分或去噪后得到 EEF action chunk。
+
+需要注意：
+
+```text
+z_hat 不直接输入 Action Expert
+```
+
+它通过下面的路径间接影响动作：
+
+```text
+z_hat
+  → LaWM
+  → uT_hat
+  → Action Expert
+```
+
+此外，论文所有实验都不向 Action Expert 输入 proprioceptive state，只使用 RGB 视觉上下文。
+````
+
+## 消息 25：用户
+
+````text
+VLM 语义上下文是latent action吗
+````
+
+## 消息 26：回答
+
+````markdown
+不是。**VLM 语义上下文和 latent action 是两种不同的信息**，虽然它们都来自 VLM。
+
+```text
+当前图像 + 指令 + 其他视角
+              ↓
+             VLM
+        ┌─────┴──────────┐
+        ↓                ↓
+VLM 语义上下文       LA Query hidden state
+H_VLM                  ↓ aggregation
+        │             z_hat
+        │               ↓
+        │             LaWM
+        │               ↓
+        │             uT_hat
+        │               │
+        └──────┬────────┘
+               ↓
+         Action Expert
+```
+
+### VLM 语义上下文 `H_VLM`
+
+它是一整组 VLM hidden tokens，保留：
+
+- 当前图像内容；
+- 语言指令；
+- 物体语义和空间关系；
+- 其他相机视角信息。
+
+它直接进入 Action Expert 的 Semantic Attention，回答：
+
+```text
+任务是什么？
+操作哪个物体？
+指令的语义约束是什么？
+```
+
+### Latent action `z_hat`
+
+`z_hat` 由 LA Query 的 hidden state 经过 query aggregation/projection 得到：
+
+```text
+z_hat = Aggregate(LA_Query_hidden)
+```
+
+它是一个更紧凑的视觉转移代码，回答：
+
+```text
+下一段时间内，场景应该发生什么变化？
+```
+
+`z_hat` 不直接进入 Action Expert，而是先经过：
+
+```text
+uT_hat = LaWM(u, z_hat)
+```
+
+转换成空间化的未来视觉子目标。
+
+因此 Action Expert 同时使用：
+
+```text
+H_VLM
+  → 语义流：任务意图
+
+Concat(u, uT_hat)
+  → 动力学流：当前状态到未来子目标的变化
+```
+
+一句话区分：
+
+```text
+VLM 语义上下文：完整地说明“要做什么”
+
+latent action：压缩地表示“下一步要发生什么变化”
+```
+````
+
+## 消息 27：用户
+
+````text
+讲一下实验结果和消融实验
+````
+
+## 消息 28：回答
+
+````markdown
+先给结论：
+
+> LaWAM 最有说服力的优势是推理效率，而不是大幅提高成功率。消融实验支持“latent visual subgoal 确实有用”，但还没有完全拆清 LaWM、蒸馏和 Knowledge Insulation 各自的独立贡献。
+
+## 一、主实验结果
+
+### 1. LIBERO
+
+LIBERO 包含 4 个 suite、40 个任务，每个任务测试 50 次，共 2,000 次。
+
+| 方法 | Long | Goal | Object | Spatial | 平均成功率 | 延迟/chunk |
+|---|---:|---:|---:|---:|---:|---:|
+| pi0.5 | 92.4 | 98.0 | 98.2 | 98.8 | 96.9 | 220 ms |
+| VLA-JEPA | 95.8 | 97.2 | 99.6 | 96.2 | 97.2 | — |
+| Fast-WAM | 95.2 | 97.0 | 100.0 | 98.2 | 97.6 | 486 ms |
+| Cosmos-Policy | 97.6 | 98.2 | 100.0 | 98.1 | 98.5 | 1,413 ms |
+| LingBot-VA | 98.5 | 97.2 | 99.6 | 98.5 | 98.5 | 4,482 ms |
+| **LaWAM** | **97.0** | **98.4** | **99.6** | **99.4** | **98.6** | **187 ms** |
+
+LaWAM 的表现：
+
+- 平均成功率 98.6%，表中最高；
+- Long 任务 97.0%；
+- Goal 任务 98.4%；
+- Object 任务 99.6%；
+- Spatial 任务 99.4%；
+- 完整 action chunk 推理延迟为 187 ms。
+
+延迟方面：
+
+```text
+相对 pi0.5：约快 1.18 倍
+相对 Fast-WAM：约快 2.6 倍
+相对 Cosmos-Policy：约快 7.6 倍
+相对 LingBot-VA：约快 24 倍
+```
+
+但成功率需要保守理解：
+
+```text
+LaWAM：98.6%
+次优方法：98.5%
+差距：0.1 个百分点
+```
+
+在 2,000 次 trial 中，0.1 个百分点约等于 2 次成功的数量级。论文没有报告多训练种子、方差或置信区间，所以不能证明这 0.1 个百分点具有统计显著性。
+
+因此 LIBERO 的准确结论是：
+
+```text
+LaWAM 达到了最强一档成功率，
+同时显著降低了 pixel-space WAM 的推理延迟。
+```
+
+而不是：
+
+```text
+LaWAM 的任务成功率显著超过所有方法。
+```
+
+### 2. RoboTwin 2.0
+
+RoboTwin 包含 50 个双臂操作任务，每个任务分别在 clean 和 randomized 场景测试 100 次。
+
+| 方法 | Clean SR | Randomized SR | 两者平均 |
+|---|---:|---:|---:|
+| Fast-WAM | 91.98 | 90.52 | 91.25 |
+| GigaWorld-Policy | 86.36 | 85.04 | 85.70 |
+| LingBot-VA | 91.50 | **90.92** | 91.21 |
+| pi0.5 | 82.74 | 76.76 | 79.75 |
+| Motus | 88.66 | 87.02 | 87.84 |
+| **LaWAM** | **92.64** | 89.80 | **91.22** |
+
+结果说明：
+
+- LaWAM 在 clean setting 中第一，达到 92.64%；
+- 比 Fast-WAM 高 0.66 个百分点；
+- randomized setting 为 89.80%，不是第一；
+- 比 LingBot-VA 低 1.12 个百分点；
+- 比 Fast-WAM 低 0.72 个百分点；
+- clean/random 合并平均约 91.22%，与最强 pixel WAM 基本处于同一水平。
+
+因此 RoboTwin 支持的是：
+
+```text
+单步 latent subgoal 能扩展到复杂双臂操作，
+并在不生成未来视频的情况下保持竞争力。
+```
+
+它不支持“所有随机化场景都优于 pixel WAM”。
+
+LaWAM 在部分任务上仍明显较弱：
+
+| 任务 | Clean | Randomized |
+|---|---:|---:|
+| Hanging Mug | 51 | 43 |
+| Open Microwave | 41 | 43 |
+| Turn Switch | 47 | 56 |
+| Place Can Basket | 92 | 65 |
+| Stack Blocks Three | 90 | 75 |
+
+这些任务通常需要更精细的几何、接触或多阶段控制。
+
+### 3. 真实机器人实验
+
+每个任务测试 30 次。
+
+| 方法 | Pick-and-Place | Open Drawer | Fold Towel | 平均 |
+|---|---:|---:|---:|---:|
+| pi0.5 | 86.7 | 80.0 | 83.3 | 83.3 |
+| GR00T-N1.6 | 83.3 | 76.7 | 46.7 | 68.9 |
+| Fast-WAM | 56.7 | 63.3 | 70.0 | 63.3 |
+| LingBot-VA | 76.7 | 83.3 | 0.0 | 53.3 |
+| **LaWAM** | **93.3** | **86.7** | **90.0** | **90.0** |
+
+LaWAM 在三个任务上都是第一：
+
+- Pick-and-Place：93.3%；
+- Open Drawer：86.7%；
+- Fold Towel：90.0%；
+- 平均：90.0%。
+
+毛巾折叠最能体现低延迟的实际价值。毛巾在模型推理期间仍会继续运动，高延迟模型输出动作时，动作可能已经对应旧状态：
+
+```text
+采集观测
+  ↓ 模型推理耗时过长
+毛巾状态已经变化
+  ↓
+动作与当前状态不匹配
+```
+
+不过每任务只有 30 次，成功率的最小变化单位是 3.33 个百分点。LaWAM 90.0% 对 pi0.5 83.3%，总计约多成功 6/90 次，仍然需要更多试验和置信区间。
+
+### 4. LaWM 是否真的学到了 dynamics
+
+论文使用两类证据。
+
+#### 500 条 LIBERO open-loop rollout
+
+作者比较：
+
+```text
+LaWM rollout 与真实未来的特征相似度
+真实未来与初始状态的特征相似度
+LaWM rollout 与初始状态的特征相似度
+```
+
+结果显示：
+
+- rollout 与真实未来保持较高相似度；
+- rollout 会逐渐远离初始特征；
+- LaWM 不是简单复制当前状态。
+
+#### 跨环境、跨具身 rollout
+
+将同一 latent-action sequence 应用到不同初始场景：
+
+```text
+相同 latent action
++ 不同初始视觉状态
+→ 不同但上下文合理的 latent rollout
+```
+
+这支持：
+
+- latent action 表示相对抽象的视觉转移；
+- LaWM 将该转移绑定到当前场景和机器人。
+
+但这些主要是 latent 可视化，不是未见机器人上的真实闭环执行成功率，也没有验证多个候选真实动作的反事实后果。
+
+## 二、组件消融实验
+
+Figure 6 比较了以下配置：
+
+```text
+w/o WM
+w/o KI & distill
+w/o distill
+w/o pretrain
+完整 LaWAM
+```
+
+论文没有提供完整数值表，只给出柱状图和定性结论，因此不应该凭图猜测精确数字。
+
+### 1. `w/o WM`
+
+该配置移除 LaWM 提供的 latent visual subgoal。
+
+结果：
+
+- 性能下降最大；
+- LIBERO-Long 上下降尤其明显。
+
+说明只使用 VLM 或紧凑 latent-action 信息不够，Action Expert 从空间化的未来特征中获得了明显收益。
+
+作者据此认为：
+
+```text
+latent action 只有先经过 LaWM，
+展开成当前场景中的未来视觉特征，
+才最适合指导动作生成。
+```
+
+但该消融还不能完全排除：
+
+- LaWM 带来的额外参数量；
+- 额外的 future-feature supervision；
+- 更深的网络计算；
+
+也是性能提升的一部分。
+
+### 2. `w/o distill`
+
+移除：
+
+```text
+L_distill = MSE(z_hat, z_teacher)
+```
+
+此时 VLM 不再直接模仿 IDM 定义的 latent action，只能通过 subgoal loss 和 action loss间接学习如何驱动 LaWM。
+
+结果明显下降，说明：
+
+- LaWM 对输入 latent 的分布比较敏感；
+- 只靠终点特征误差不足以稳定学习接口；
+- VLM 需要明确学习 IDM 的 latent 坐标系。
+
+### 3. `w/o KI & distill`
+
+该配置同时去掉：
+
+- Knowledge Insulation；
+- latent-action distillation。
+
+性能比仅去掉 distillation 进一步下降。
+
+作者的解释是：
+
+```text
+一方面，z_hat 没有与 IDM latent 对齐；
+另一方面，Action Expert 的梯度可能破坏预训练动力学表示。
+```
+
+但这里存在一个实验设计限制：
+
+```text
+论文没有单独报告只去掉 KI 的完整结果。
+```
+
+因此无法从该组合消融中精确计算 Knowledge Insulation 自身贡献了多少。
+
+### 4. `w/o pretrain`
+
+去掉大规模预训练后性能下降，说明：
+
+- 4,500 小时视频学到的 dynamics prior 有价值；
+- 仅依靠 benchmark 后训练数据不足以达到完整模型性能。
+
+但论文没有进一步分别消融：
+
+```text
+去掉人类视频
+去掉机器人无动作标签视频
+改变各数据源比例
+```
+
+所以无法知道 1,500 小时人类视频单独贡献了多少。
+
+### 5. 完整 LaWAM
+
+完整模型同时包含：
+
+```text
+LaWM 预训练
++ latent-action distillation
++ subgoal supervision
++ Knowledge Insulation
++ Action flow matching
+```
+
+在四个 LIBERO suite 上整体最好。
+
+## 三、混合控制频率消融
+
+Appendix Figure 7 比较：
+
+```text
+w/o pos
+w/ pos
+only 20Hz
+```
+
+作者从同一批原生 20 Hz LIBERO 轨迹下采样得到 10 Hz 和 5 Hz 数据，再联合训练 5/10/20 Hz。
+
+### `w/o pos`
+
+混合三种频率，但不加入物理时间编码。
+
+结果明显下降，因为相同 action token 下标对应不同真实时间：
+
+```text
+5 Hz 的第 5 个 token  = 1.0 秒
+20 Hz 的第 5 个 token = 0.25 秒
+```
+
+### `w/ pos`
+
+加入：
+
+```text
+physical_time_i = i / control_frequency
+```
+
+性能大部分恢复到原生 20 Hz 模型附近。
+
+### `only 20Hz`
+
+只使用原始 20 Hz 数据，是该受控实验的上界参考。
+
+这项消融比 Figure 6 更干净，因为：
+
+- 使用相同原始轨迹；
+- 任务、视觉域、具身和语言完全相同；
+- 只改变控制频率与时间编码。
+
+因此它较有力地证明了物理时间编码能够缓解 mixed-frequency confusion。
+
+## 四、综合判断
+
+实验最强地支持：
+
+```text
+1. latent-space future prediction 比视频生成快很多；
+2. latent visual subgoal 对动作生成确实有帮助；
+3. latent-action distillation 对稳定驱动 LaWM 很重要；
+4. 物理时间编码对混合频率训练有效。
+```
+
+实验尚未充分证明：
+
+```text
+1. LaWM 能进行多候选反事实规划；
+2. Knowledge Insulation 的独立贡献有多大；
+3. 人类视频的独立贡献有多大；
+4. 0.1 个百分点的 LIBERO 领先具有统计显著性；
+5. 跨具身 latent rollout 等价于真实跨具身控制迁移。
+```
+
+所以这篇论文最可靠的结论是：
+
+> LaWAM 用一个轻量、单次前向的 latent subgoal，获得了接近或达到最强 WAM 的控制性能，同时显著降低了推理延迟。
+````

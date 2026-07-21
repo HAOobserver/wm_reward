@@ -2475,3 +2475,487 @@ gh auth login
 
 正文保留综合整理后的论文解读，附录保留完整问答，方便分别进行系统阅读和追溯对话。
 
+---
+
+### 问答 21：Actor 与世界模型是否同时更新
+
+**用户：**
+
+> Actor 的更新和 WM 的 SFT 是同时进行的吗？
+
+**回答：**
+
+结论是：
+
+> Actor 和世界模型在同一个在线训练阶段中协同更新，但不是通过同一个 loss 做一次“同时反向传播”；论文也没有说明二者是否在每个训练 step 严格同步。
+
+右侧框架图表达了两条独立反馈路径：
+
+```text
+世界模型预测视频
+        ↓
+Actor 执行动作
+        ↓
+环境返回真实视频
+        ├─────────────────────────────┐
+        ↓                             ↓
+计算 Reconstruction Reward       如果 rollout 成功
+        ↓                             ↓
+使用 RL 更新 Actor              Video SFT + KL 更新 WM
+```
+
+两种更新的区别：
+
+| 项目 | Actor 更新 | 世界模型更新 |
+|---|---|---|
+| 训练信号 | 预测视频与执行视频的 reconstruction reward | 成功 rollout 的真实视频 |
+| 目标函数 | Policy gradient | $L_{\text{video}}+\lambda_{\text{KL}}L_{\text{KL}}$ |
+| 是否依赖最终成功 | 论文框架中不要求成功也可计算重建 reward | 只有成功轨迹才进入 Video SFT |
+| 更新参数 | Actor 参数 | 当前世界模型参数 |
+| 是否共用反向传播 | 否 | 否 |
+
+因此更可能的训练逻辑是：
+
+```text
+1. 使用当前 WM 和 Actor 收集 rollout；
+2. 根据预测视频和真实视频计算 reward，更新 Actor；
+3. 如果 rollout 成功，将视频加入 WM 训练数据；
+4. 使用成功视频对 WM 做 Video SFT + KL；
+5. 使用更新后的 WM 和 Actor 继续交互。
+```
+
+在工程实现中，第 3–4 步也可能先把成功视频存入 buffer，再按一定频率批量更新世界模型，而不是每成功一次立即更新。
+
+论文只说明训练采用 mixed online reinforcement learning and video fine-tuning，并未给出：
+
+- Actor 与 WM 的更新先后顺序；
+- Actor/WM update ratio；
+- WM 是立即更新还是周期性批量更新；
+- 两类 optimizer 是否交替执行；
+- 成功轨迹 buffer 的具体机制。
+
+所以从 Figure 1 只能确定二者“共同演化”，不能断言它们在同一个 optimizer step 中严格同时更新。图中的 `If Success` 还表明 WM 更新是条件触发的，而 Actor 的 reconstruction reward 路径不受这个条件直接控制。
+
+---
+
+### 问答 22：消融实验解读
+
+**用户：**
+
+> 讲一下消融实验。
+
+**回答：**
+
+消融实验的目的是通过删除或替换某个组件，判断最终性能提升究竟来自哪里。WAM-RL 论文主要提供了两组显式消融，以及一组可以辅助理解但不够干净的主结果比较。
+
+#### 1. Reconstruction Reward 类型消融
+
+该实验在 RLBench 的 Water Plants 任务上，将 Actor 的 reconstruction reward 替换为不同视觉距离：
+
+| 方法 | Water Plants 成功率 |
+|---|---:|
+| Base | 19% |
+| $\pi$RL（Actor-only） | 18% |
+| Pixel MSE | **21%** |
+| Optical Flow MSE | 19% |
+| DINOv2 MSE | 16% |
+| V-JEPA2 | 17% |
+
+四种 reward 分别比较：
+
+- **Pixel MSE**：预测帧与真实执行帧的 RGB 像素误差；
+- **Optical Flow MSE**：两段视频中相邻帧光流场的误差；
+- **DINOv2 MSE**：图像语义特征误差；
+- **V-JEPA2 MSE**：视频时空特征误差。
+
+Figure 2 还比较了不同 reward 在成功和失败轨迹上的分布：
+
+- 每种指标都把成功轨迹 reward 归一化到 1；
+- 失败轨迹按照同一尺度缩放；
+- 误差条表示 2 倍标准差；
+- Optical Flow 对成功和失败的区分最大；
+- Pixel MSE 的成功/失败区分相对较弱。
+
+但最终任务成功率恰好相反：
+
+- Optical Flow 区分度最强，却只得到 19%，没有超过 Base；
+- Pixel MSE 区分度较弱，却得到最高的 21%。
+
+作者给出的解释是：
+
+1. Pixel MSE 与世界模型本身的视频像素预测目标更一致；
+2. Actor 做出偏离世界模型想象的 OOD 动作时，像素差异会迅速增大；
+3. 这种强惩罚相当于对策略进行正则化，因此训练更稳定。
+
+更保守的理解是：
+
+> Reward 能否区分最终成功和失败，不等于它是否容易被策略梯度优化。
+
+RL 还依赖：
+
+- Reward 在动作附近是否连续和平滑；
+- Reward 方差是否足够小；
+- 中间步骤是否提供有意义的信用分配；
+- Reward 是否与策略使用的世界模型表示对齐。
+
+但该消融存在明显限制：
+
+- 只有 Water Plants 一个任务；
+- 没有随机种子、标准差或置信区间；
+- 16%–21% 都是较低的绝对成功率；
+- 1–3 个百分点的差异可能是采样波动；
+- 主结果中 WAM-RL 是 22%，该消融中 Pixel MSE 是 21%，差异没有解释；
+- 论文没有给出 reward 原始尺度和归一化方式，因此不同 reward 是否公平缩放也无法判断。
+
+#### 2. Online Video SFT 消融
+
+Figure 3 对比了有无 Video SFT 时，一个 open-loop action chunk 内的预测行为。
+
+不使用 Video SFT：
+
+```text
+第一次抓取失败
+   ↓
+世界模型没有预测修正动作
+   ↓
+继续沿错误轨迹运动
+   ↓
+进入 OOD 状态
+```
+
+使用 Video SFT：
+
+```text
+第一次抓取失败
+   ↓
+重新调整夹爪位置
+   ↓
+再次尝试抓取
+   ↓
+最终成功
+```
+
+作者据此认为，成功在线轨迹中包含“局部失败 → 修正 → 最终成功”的序列，Video SFT 使世界模型学会了恢复行为。
+
+这组结果只能算定性消融，因为论文没有报告：
+
+- 有/无 Video SFT 的完整任务成功率；
+- 恢复行为触发率；
+- 恢复成功率；
+- 多个任务或多个案例；
+- 多随机种子结果；
+- 两组是否使用完全相同的 Actor checkpoint、reward 和交互数据。
+
+所以 Figure 3 能说明“恢复行为可能出现”，但不能单独证明 Video SFT 稳定提高了长时程成功率。
+
+#### 3. Actor-only 与联合更新的比较
+
+主结果也可以辅助观察 Actor-only 和联合优化的差异：
+
+| 方法 | LIBERO-Object | Water Plants |
+|---|---:|---:|
+| Base | 68% | 19% |
+| $\pi$RL（Actor-only） | 78% | 18% |
+| WAM-RL | **82%** | **22%** |
+
+在 LIBERO-Object 上：
+
+- Actor-only 已经带来 $+10$ 个百分点；
+- WAM-RL 在此基础上再增加 $+4$ 个百分点。
+
+在 Water Plants 上：
+
+- Actor-only 从 19% 变成 18%，没有改善；
+- WAM-RL 达到 22%，相对 Base 增加 3 个百分点。
+
+这组结果符合作者的叙事：
+
+- 短时程任务中，改善 Actor 翻译动作的能力已经有明显作用；
+- 长时程任务中，世界模型预测误差会累积，因此还需要更新世界模型。
+
+但它不是一个干净的“是否更新 WM”消融，因为从 $\pi$RL 到 WAM-RL 不只改变了一个变量：
+
+- 是否使用 reconstruction reward 发生变化；
+- 是否进行 Online Video SFT 发生变化；
+- 是否加入 latent KL 发生变化；
+- Actor 的具体训练信号也可能不同。
+
+因此不能仅凭 18% 对 22% 就断言增益全部来自 Video SFT。
+
+#### 4. 论文缺失的关键消融
+
+要真正拆清每个组件的贡献，至少需要下面的 2×2 实验：
+
+| Actor 训练 | WM 训练 | 目的 |
+|---|---|---|
+| 无 RL | 无 Video SFT | Base |
+| Reconstruction RL | 无 Video SFT | 单独测 Actor reward |
+| 无 Actor RL | Video SFT + KL | 单独测 WM 更新 |
+| Reconstruction RL | Video SFT + KL | 完整 WAM-RL |
+
+还应补充：
+
+1. **无 KL 对照**：验证 KL 是否真的防止 latent drift 和训练崩溃；
+2. **不同 $\lambda_{\text{KL}}$**：分析稳定性与适应性的权衡；
+3. **成功轨迹 vs 全部轨迹**：判断 success-only SFT 是否必要；
+4. **相同 reconstruction reward 下有/无 Video SFT**：隔离世界模型更新贡献；
+5. **Actor/WM 不同更新比例**：确认共同训练是否对 schedule 敏感；
+6. **任务 reward + reconstruction reward**：验证直接任务信号能否避免“失败但高 reward”；
+7. **多任务、多随机种子和置信区间**：判断小幅增益是否可靠。
+
+#### 5. 对消融实验的最终判断
+
+当前消融能够支持两个初步观察：
+
+1. Pixel MSE 在作者的 Water Plants 设置中比 Optical Flow、DINOv2 和 V-JEPA2 更有效；
+2. Video SFT 后的世界模型可能产生失败恢复行为。
+
+但它还不能充分证明：
+
+- Pixel MSE 在其他任务上也最好；
+- Video SFT 是 22% 成功率的主要原因；
+- KL 是联合训练稳定的必要条件；
+- 联合更新对一般长时程任务都“至关重要”。
+
+因此这部分实验更适合被理解为支持方法可行性的早期证据，而不是完整的组件因果验证。
+
+---
+
+### 问答 23：Optical Flow 是什么
+
+**用户：**
+
+> Optical Flow 是什么？
+
+**回答：**
+
+Optical Flow（光流）用于估计连续两帧图像之间，每个像素在图像平面上的表观运动。
+
+给定相邻两帧：
+
+$$
+I_t,\qquad I_{t+1}
+$$
+
+光流算法输出一个与图像分辨率对应的二维向量场：
+
+$$
+F_t(p)
+=
+\left(
+u_t(p),
+v_t(p)
+\right)
+$$
+
+其中：
+
+- $p=(x,y)$ 表示一个像素位置；
+- $u$ 表示水平方向位移；
+- $v$ 表示垂直方向位移。
+
+对应关系可以近似写成：
+
+$$
+I_t(p)
+\approx
+I_{t+1}
+\left(
+p+F_t(p)
+\right)
+$$
+
+例如，一个杯子在下一帧向右移动 5 个像素、向下移动 1 个像素，那么杯子区域的光流向量大致为：
+
+$$
+F=(5,1)
+$$
+
+光流向量可以提供：
+
+- **方向**：由 $(u,v)$ 的方向决定；
+- **运动幅度**：$\sqrt{u^2+v^2}$，单位通常是像素/帧；
+- **运动区域**：哪些像素或物体正在移动。
+
+需要注意，光流表示的是二维图像中的表观运动，并不等同于：
+
+- 机器人关节速度；
+- 物体真实三维速度；
+- 深度方向运动；
+- 精确物理动力学。
+
+相机自身运动、遮挡、反光、光照变化和纹理不足都可能导致光流误差。
+
+#### Optical Flow 在 WAM-RL 中如何使用
+
+论文有两段未来视频：
+
+1. 世界模型预测的视频 $\hat{x}_{t+1:t+H}$；
+2. Actor 在仿真器中执行后得到的视频 $x_{t+1:t+H}$。
+
+分别对两段视频的相邻帧计算光流：
+
+$$
+\hat{F}_h
+=
+\operatorname{OF}
+\left(
+\hat{x}_{t+h-1},
+\hat{x}_{t+h}
+\right)
+$$
+
+$$
+F_h
+=
+\operatorname{OF}
+\left(
+x_{t+h-1},
+x_{t+h}
+\right)
+$$
+
+再比较两个光流场：
+
+$$
+d_{\text{flow}}
+=
+\frac{1}{H-1}
+\sum_h
+\left\|
+\hat{F}_h-F_h
+\right\|^2
+$$
+
+如果将距离转换为 reward，可以直观写成：
+
+$$
+r_{\text{flow}}
+\approx
+-d_{\text{flow}}
+$$
+
+其含义是：
+
+```text
+WM 预测的机械臂和物体运动
+            与
+仿真器中真实发生的机械臂和物体运动
+越接近 → reward 越高
+```
+
+它比较的是运动结构，而不是直接比较 RGB 颜色，所以通常不会像 Pixel MSE 那样强烈受轻微颜色或纹理差异影响。
+
+在论文的消融实验中，Optical Flow reward 对成功和失败轨迹的区分最明显，但 Water Plants 成功率只有 19%，低于 Pixel MSE 的 21%。这说明“更能区分成功和失败”并不必然意味着更适合策略梯度优化。
+
+最后需要区分：
+
+> **Optical Flow 是视频运动估计；Flow Matching / Flow-SDE 是生成动作或样本的概率建模方法。二者名称中都有 Flow，但没有直接关系。**
+
+论文没有说明具体使用了哪种光流估计算法，因此无法从当前 PDF 判断它使用的是传统方法还是神经网络光流模型。
+
+---
+
+### 问答 24：消融表格与 Base 的含义
+
+**用户：**
+
+> 表格是什么意思，Base 是什么？
+
+**回答：**
+
+这里讨论的是论文 Table 2 的 reconstruction reward 消融表：
+
+| 方法 | Water Plants 成功率 |
+|---|---:|
+| Base | 19% |
+| $\pi$RL | 18% |
+| Pixel MSE | 21% |
+| Optical Flow MSE | 19% |
+| DINOv2 MSE | 16% |
+| V-JEPA2 | 17% |
+
+表格右侧的数字是最终任务成功率，不是 reward 数值。它表示使用对应训练方法后，策略在 RLBench Water Plants 评测中完成任务的比例。论文没有报告具体评测回合数，因此不能确定每个百分比对应多少次成功。
+
+#### Base 是什么
+
+`Base` 是未经在线 RL 后训练的预训练 World-Action 模型，即论文实验采用的原始 Genie Envisioner-ACT checkpoint：
+
+```text
+专家演示监督预训练
+        ↓
+得到原始 World Model + Actor
+        ↓
+不进行 Actor RL
+不进行 Online Video SFT
+不进行在线 WM 适应
+        ↓
+Base
+```
+
+Base 的作用是提供参照：
+
+> 如果不使用 WAM-RL 的在线后训练，原始模型能够达到多少成功率？
+
+在 Water Plants 上，Base 是 19%。后面的每一行都与 19% 比较：
+
+- $\pi$RL：18%，比 Base 低 1 个百分点；
+- Pixel MSE：21%，比 Base 高 2 个百分点；
+- Optical Flow MSE：19%，与 Base 相同；
+- DINOv2 MSE：16%，比 Base 低 3 个百分点；
+- V-JEPA2：17%，比 Base 低 2 个百分点。
+
+#### 每一行分别代表什么
+
+**1. Base — 19%**
+
+- 原始预训练 WA 模型；
+- 没有在线 RL；
+- 没有 Online Video SFT；
+- 是所有方法的比较起点。
+
+**2. $\pi$RL — 18%**
+
+- 只对 flow-based Actor 做在线 RL；
+- 世界模型不进行 WAM-RL 式联合适应；
+- 用于观察“只更新 Actor”是否有效；
+- Water Plants 上没有超过 Base。
+
+**3. Pixel MSE — 21%**
+
+- 使用预测视频与环境执行视频的像素 MSE 构造 reconstruction reward；
+- 按论文上下文，其余 WAM-RL 框架保持基本一致；
+- 是该 reward 消融中表现最好的设置。
+
+**4. Optical Flow MSE — 19%**
+
+- 比较预测视频和环境视频的光流场；
+- 虽然最能区分成功和失败轨迹，但最终成功率与 Base 相同。
+
+**5. DINOv2 MSE — 16%**
+
+- 比较预测帧和环境帧的 DINOv2 视觉特征；
+- 结果低于 Base。
+
+**6. V-JEPA2 — 17%**
+
+- 比较两段视频的 V-JEPA2 时空特征；
+- 同样没有超过 Base。
+
+#### 表格能说明什么
+
+表格能够说明：
+
+> 在作者的 Water Plants 设置中，使用 Pixel MSE 构造 reconstruction reward 的结果最好。
+
+它不能说明：
+
+- Pixel MSE 在所有机器人任务上都最好；
+- 21% 与 19% 的差异具有统计显著性；
+- Pixel MSE 单独贡献了全部提升；
+- 世界模型 SFT、KL 和 Actor RL 各自贡献了多少。
+
+原因是论文没有报告随机种子、置信区间和完整的组件隔离实验。
+
+另外，论文主结果 Table 1 中完整 WAM-RL 是 22%，而 Table 2 的 Pixel MSE 是 21%。论文没有解释这 1 个百分点的差异，可能来自不同运行、评测采样或实验设置，但当前 PDF 无法确认。
+
